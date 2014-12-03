@@ -1,0 +1,6 @@
+#!/bin/bash
+set -e
+
+psql -d postgres -c "CREATE DATABASE test;"
+
+PGDATABASE=test /vagrant/tests/run-scripts /vagrant/tests/schema

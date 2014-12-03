@@ -1,0 +1,5 @@
+PGDATABASE=minerva /vagrant/scripts/doc-db directory > /vagrant/doc/source/database-schema/directory.rst
+PGDATABASE=minerva /vagrant/scripts/doc-db system > /vagrant/doc/source/database-schema/system.rst
+PGDATABASE=minerva /vagrant/scripts/doc-db trend > /vagrant/doc/source/database-schema/trend.rst
+PGDATABASE=minerva /vagrant/scripts/doc-db attribute > /vagrant/doc/source/database-schema/attribute.rst
+PGDATABASE=minerva /vagrant/scripts/doc-db notification > /vagrant/doc/source/database-schema/notification.rst
