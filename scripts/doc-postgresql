@@ -88,6 +88,9 @@ class Schema(object):
         with closing(conn.cursor()) as cursor:
             cursor.execute(query, args)
 
+            if cursor.rowcount < 1:
+                raise Exception('no schema named {}'.format(name))
+
             description, = cursor.fetchone()
 
         return description
