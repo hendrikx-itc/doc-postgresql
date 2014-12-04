@@ -160,7 +160,8 @@ class Table(object):
             ''
         ] + list(to_lines(tabulate(
             [(column.name, column.type, column.description) for column in self.columns],
-            headers=column_names
+            headers=column_names,
+            tablefmt="grid"
         ))) + ['']
 
 
@@ -220,7 +221,8 @@ def doc_functions(conn, schema_name):
             ('{}({})'.format(function.name, function.arguments), function.return_type, function.description)
             for function in Function.load_all(conn, schema_name)
         ],
-        headers=column_names
+        headers=column_names,
+        tablefmt="grid"
     )))
     
 
