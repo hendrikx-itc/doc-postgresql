@@ -215,7 +215,7 @@ def doc_tables(conn, schema_name):
 def doc_functions(conn, schema_name):
     column_names = ["Name", "Return Type", "Description"]
 
-    return section_header('Functions', 1) + list(to_lines(tabulate(
+    return section_header('Functions', 1) + [''] + list(to_lines(tabulate(
         [
             ('{}({})'.format(function.name, function.arguments), function.return_type, function.description)
             for function in Function.load_all(conn, schema_name)
