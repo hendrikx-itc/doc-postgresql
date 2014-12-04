@@ -6,6 +6,10 @@
 Welcome to doc-postgresql's documentation!
 ==========================================
 
+The doc-postgresql project provides a tool to extract documentation from a live
+PostgreSQL database. It aims to document not only the tables, but also all
+other possible database objects such as functions, views, triggers etc.
+
 Contents:
 
 .. toctree::
