@@ -139,7 +139,8 @@ class Table(object):
             "SELECT pg_class.oid "
             "FROM pg_class "
             "JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace "
-            "WHERE relkind = 'r' AND pg_namespace.nspname = %s"
+            "WHERE relkind = 'r' AND pg_namespace.nspname = %s "
+            "ORDER BY pg_class.relname"
         )
 
         args = (schema_name,)
