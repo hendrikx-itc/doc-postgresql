@@ -177,7 +177,7 @@ class Function(object):
             'SELECT proname, pg_get_function_arguments(p.oid), pg_get_function_result(p.oid), d.description '
             'FROM pg_proc p '
             'JOIN pg_namespace n ON n.oid = p.pronamespace '
-            'JOIN pg_description d ON d.objoid = p.oid '
+            'LEFT JOIN pg_description d ON d.objoid = p.oid '
             'WHERE n.nspname = %s '
             'ORDER BY proname'
         )
