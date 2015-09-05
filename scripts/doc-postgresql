@@ -4,6 +4,7 @@ from operator import itemgetter
 from contextlib import closing
 from itertools import chain
 from io import StringIO
+from functools import reduce
 
 import psycopg2
 
@@ -225,7 +226,7 @@ def doc_functions(conn, schema_name):
         headers=column_names,
         tablefmt="grid"
     )))
-    
+
 
 all_doc_types = [doc_tables, doc_functions]
 
