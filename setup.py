@@ -15,7 +15,7 @@ import sys
 from setuptools import setup
 
 setup(
-    name="minerva",
+    name="doc-postgresql",
     author="Hendrikx ITC",
     author_email="info@hendrikx-itc.nl",
     version="0.0.1",
@@ -26,9 +26,6 @@ setup(
         "doc-postgresql",
     ],
     package_dir={"": "src"},
-    package_data={
-        "minerva": ["defaults/*"]
-    },
     scripts=[
         "scripts/doc-postgresql"
     ]
