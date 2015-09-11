@@ -5,13 +5,22 @@ from contextlib import closing
 from itertools import chain
 from io import StringIO
 from functools import reduce
+import os
+import sys
 
-import psycopg2
+import psycopg2.extras
 
 from tabulate import tabulate
 
 
 fst = itemgetter(0)
+
+
+def k(x):
+    def fn(*args, **kwargs):
+        return x
+
+    return fn
 
 
 def unlines(lines):
@@ -29,12 +38,83 @@ def format_value(value):
         return value
 
 
+def get_short_description(description):
+    return fst(description.split('\n'))
+
+
 def ljoin(sep, items):
     return reduce(lambda x, y: x + [sep] + y, items, [])
 
 
-class Schema(object):
-    def __init__(self, name, description):
+def rst_label(name):
+    return '.. _{}:'.format(name)
+
+
+class Database:
+    def __init__(self):
+        self.schema = None
+        self.function = None
+        self.type = None
+        self.relation = None
+        self.attribute = None
+
+    def load(self, conn):
+        self.schema = {s.oid: s for s in Schema.load_all(self, conn)}
+        self.function = {f.oid: f for f in Function.load_all(self, conn)}
+        self.type = {t.oid: t for t in Type.load_all(self, conn)}
+        self.relation = {r.oid: r for r in Relation.load_all(self, conn)}
+        self.attribute = Attribute.load_all(self, conn)
+
+        return self
+
+
+class ObjRef:
+    def __init__(self, database, oid):
+        self.database = database
+        self.oid = oid
+        self.subject = None
+
+    def get_subject(self):
+        raise NotImplementedError()
+
+    def __getattribute__(self, name):
+        if name == 'subject':
+            s = object.__getattribute__(self, 'subject')
+            if s is None:
+                s = object.__getattribute__(self, 'get_subject')()
+                object.__setattr__(self, 'subject', s)
+
+            return s
+        elif name in ('oid', 'database', 'get_subject'):
+            return object.__getattribute__(self, name)
+        else:
+            if self.subject is None:
+                self.subject = self.get_subject()
+
+            return self.subject.__getattribute__(name)
+
+    def __str__(self):
+        return self.subject.__str__()
+
+
+class TypeRef(ObjRef):
+    def get_subject(self):
+        return self.database.type.get(self.oid)
+
+
+class SchemaRef(ObjRef):
+    def get_subject(self):
+        return self.database.schema.get(self.oid)
+
+
+class RelationRef(ObjRef):
+    def get_subject(self):
+        return self.database.relation.get(self.oid)
+
+
+class Schema:
+    def __init__(self, oid, name, description):
+        self.oid = oid
         self.name = name
         self.description = description
         self.tables = []
@@ -45,7 +125,8 @@ class Schema(object):
     def all_names(conn):
         query = (
             'SELECT nspname '
-            'FROM pg_namespace'
+            'FROM pg_namespace '
+            'ORDER BY nspname'
         )
 
         with closing(conn.cursor()) as cursor:
@@ -75,16 +156,145 @@ class Schema(object):
         return description
 
     @staticmethod
-    def load(conn, name):
-        schema = Schema(name, Schema.load_description(conn, name))
+    def load_all(database, conn):
+        with closing(conn.cursor()) as cursor:
+            cursor.execute(
+                'SELECT n.oid, n.nspname, d.description '
+                'FROM pg_namespace n '
+                'LEFT JOIN pg_description d ON d.objoid = n.oid'
+            )
 
-        schema.tables = Table.load_all(conn, name)
-        schema.functions = Function.load_all(conn, name)
+            return [
+                Schema(oid, nspname, description)
+                for oid, nspname, description in cursor.fetchall()
+            ]
 
-        return schema
+    def doc_tables(self, database):
+        tables = [
+            t
+            for t in database.relation.values()
+            if t.schema.oid == self.oid and isinstance(t, Table)
+        ]
+
+        return section_header('Tables', 1) + list(chain(
+            ljoin('', (table.to_rst(database) for table in tables))
+        ))
+
+    def doc_functions(self, database):
+        functions = [
+            f for f in database.function.values() if f.schema.oid == self.oid
+        ]
+
+        return (
+            doc_functions_table(functions) +
+            [''] +
+            list(chain.from_iterable(
+                function.doc() for function in functions
+            ))
+        )
 
 
-class Column(object):
+class Attribute:
+    def __init__(self, relation, num, name, type, description):
+        self.relation = relation
+        self.num = num
+        self.name = name
+        self.type = type
+        self.description = description
+
+    @staticmethod
+    def load_from_row(database, row):
+        return Attribute(
+            RelationRef(database, row['attrelid']),
+            row['attnum'],
+            row['attname'],
+            TypeRef(database, row['atttypid']),
+            row['description']
+        )
+
+    @staticmethod
+    def load_all(database, conn):
+        with closing(conn.cursor(cursor_factory=psycopg2.extras.DictCursor)) as cursor:
+            cursor.execute(
+                'SELECT a.attrelid, a.attnum, a.attname, a.atttypid, d.description '
+                'FROM pg_attribute a '
+                'LEFT JOIN pg_description d ON d.objoid = a.attrelid AND d.objsubid = a.attnum'
+            )
+
+            return [
+                Attribute.load_from_row(database, row)
+                for row in cursor.fetchall()
+            ]
+
+
+class Relation:
+    def __init__(self, oid, schema, name, description):
+        self.oid = oid
+        self.schema = schema
+        self.name = name
+        self.description = description
+
+    @staticmethod
+    def load_from_row(database, row):
+        rel_type = relkind_mapping.get(row['relkind'], Relation)
+
+        return rel_type(
+            row['oid'],
+            SchemaRef(database, row['relnamespace']),
+            row['relname'],
+            row['description']
+        )
+
+    @staticmethod
+    def load_all(database, conn):
+        with closing(conn.cursor(cursor_factory=psycopg2.extras.DictCursor)) as cursor:
+            cursor.execute(
+                'SELECT c.oid, c.relkind, c.relnamespace, c.relname, d.description '
+                'FROM pg_class c '
+                'LEFT JOIN pg_description d ON d.objoid = c.oid'
+            )
+
+            return [
+                Relation.load_from_row(database, row)
+                for row in cursor.fetchall()
+            ]
+
+    def to_rst(self, database):
+        return section_header(self.name, 2)
+
+
+class Table(Relation):
+    def to_rst(self, database):
+        columns = [
+            a
+            for a in database.attribute
+            if a.relation.oid == self.oid and a.num > 0
+        ]
+        column_names = ["Name", "Type", "Description"]
+
+        return [
+            '.. _{}.{}:'.format(self.schema.name, self.name),
+            ''
+        ] + section_header(self.name, 2) + [
+            '',
+            format_value(self.description),
+            ''
+        ] + list(to_lines(tabulate(
+            [
+                (column.name, column.type.name, column.description)
+                for column in columns
+            ],
+            headers=column_names,
+            tablefmt="grid"
+        ))) + ['']
+
+
+relkind_mapping = {
+    'r': Table
+}
+
+
+class Column:
     def __init__(self, name, type, description):
         self.name = name
         self.type = type
@@ -105,95 +315,154 @@ class Column(object):
         with closing(conn.cursor()) as cursor:
             cursor.execute(query, args)
 
-            return [Column(name, type, description) for name, type, description in cursor.fetchall()]
+            return [
+                Column(name, type, description)
+                for name, type, description in cursor.fetchall()
+            ]
 
 
-class Table(object):
-    def __init__(self, name, columns, description):
+class Type:
+    def __init__(self, oid, schema, name, sql_name):
+        self.oid = oid
+        self.schema = schema
         self.name = name
-        self.columns = columns
-        self.description = description
+        self.sql_name = sql_name
+
+    def __str__(self):
+        return self.sql_name
 
     @staticmethod
-    def load(conn, oid):
-        query = (
-            "SELECT c.relname, d.description "
-            "FROM pg_class c "
-            "LEFT JOIN pg_description d ON d.objoid = c.oid AND d.objsubid = 0 "
-            "WHERE c.oid = %s"
-        )
+    def load_from_row(database, row):
+        if row['typelem'] > 0:
+            return ArrayType(
+                row['oid'],
+                SchemaRef(database, row['typnamespace']),
+                row['typname'],
+                row['sql_name'],
+                TypeRef(database, row['typelem'])
+            )
 
-        args = (oid,)
-
-        with closing(conn.cursor()) as cursor:
-            cursor.execute(query, args)
-
-            (table_name, description) = cursor.fetchone()
-
-        columns = Column.load_all(conn, oid)
-
-        return Table(table_name, columns, description)
+        else:
+            return Type(
+                row['oid'],
+                SchemaRef(database, row['typnamespace']),
+                row['typname'],
+                row['sql_name']
+            )
 
     @staticmethod
-    def load_all(conn, schema_name):
+    def load_all(database, conn):
         query = (
-            "SELECT pg_class.oid "
-            "FROM pg_class "
-            "JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace "
-            "WHERE relkind = 'r' AND pg_namespace.nspname = %s "
-            "ORDER BY pg_class.relname"
+            'SELECT oid, format_type(oid, NULL) AS sql_name, * '
+            'FROM pg_type'
         )
 
-        args = (schema_name,)
+        with closing(conn.cursor(cursor_factory=psycopg2.extras.DictCursor)) as cursor:
+            cursor.execute(query)
 
-        with closing(conn.cursor()) as cursor:
-            cursor.execute(query, args)
+            rows = cursor.fetchall()
 
-            return [Table.load(conn, oid) for oid, in cursor.fetchall()]
-
-    def to_rst(self):
-        column_names = ["Name", "Type", "Description"]
-
-        return [
-            self.name,
-            len(self.name) * '`',
-            '',
-            format_value(self.description),
-            ''
-        ] + list(to_lines(tabulate(
-            [(column.name, column.type, column.description) for column in self.columns],
-            headers=column_names,
-            tablefmt="grid"
-        ))) + ['']
+            return [Type.load_from_row(database, row) for row in rows]
 
 
-class Function(object):
-    def __init__(self, name, arguments, return_type, description):
+class ArrayType:
+    def __init__(self, oid, namespace_name, name, sql_name, elem_type):
+        self.oid = oid
+        self.namespace_name = namespace_name
+        self.name = name
+        self.sql_name = sql_name
+        self.elem_type = elem_type
+
+    def __str__(self):
+        return '{}[]'.format(self.elem_type.name)
+
+
+class Argument:
+    def __init__(self, name, arg_type):
+        self.name = name
+        self.type = arg_type
+
+    def __str__(self):
+        return str(self.type)
+
+
+class Function:
+    def __init__(self, oid, schema, name, arguments, return_type, description):
+        self.oid = oid
+        self.schema = schema
         self.name = name
         self.arguments = arguments
         self.return_type = return_type
         self.description = description
 
     @staticmethod
-    def load_all(conn, schema_name):
+    def load_arguments(database, argnames, argtypes):
+        if len(argtypes) == 0:
+            arg_type_oids = []
+        else:
+            arg_type_oids = [int(t) for t in argtypes.split(' ')]
+
+        if argnames is None:
+            argnames = [''] * len(arg_type_oids)
+
+        return [
+            Argument(argname, TypeRef(database, argtype))
+            for argname, argtype in zip(argnames, arg_type_oids)
+        ]
+
+    @staticmethod
+    def load_all(database, conn):
         query = (
-            'SELECT proname, pg_get_function_arguments(p.oid), pg_get_function_result(p.oid), d.description '
+            'SELECT p.oid, p.pronamespace, p.proname, p.proargnames, p.proargtypes, pg_get_function_result(p.oid), d.description '
             'FROM pg_proc p '
-            'JOIN pg_namespace n ON n.oid = p.pronamespace '
-            'LEFT JOIN pg_description d ON d.objoid = p.oid '
-            'WHERE n.nspname = %s '
-            'ORDER BY proname'
+            'LEFT JOIN pg_description d ON d.objoid = p.oid'
         )
 
-        args = (schema_name,)
-
         with closing(conn.cursor()) as cursor:
-            cursor.execute(query, args)
+            cursor.execute(query)
 
             return [
-                Function(name, arguments, return_type, description)
-                for name, arguments, return_type, description in cursor.fetchall()
+                Function(
+                    oid,
+                    SchemaRef(database, pronamespace),
+                    name,
+                    Function.load_arguments(database, argnames, argtypes),
+                    return_type,
+                    description
+                )
+                for oid, pronamespace, name, argnames, argtypes, return_type, description
+                in cursor.fetchall()
             ]
+
+    def signature(self):
+        return '{}({}) -> {}'.format(
+            self.name,
+            ', '.join(str(a) for a in self.arguments),
+            self.return_type
+        )
+
+    def ident(self):
+        return '{}.{}({})'.format(
+            self.schema.name,
+            self.name,
+            ', '.join(str(a) for a in self.arguments)
+        )
+
+    def label(self):
+        return rst_label(self.ident())
+
+    def ref(self):
+        return ':ref:`{}`'.format(self.ident())
+
+    def doc(self):
+        return (
+            [
+                self.label(),
+                ''
+            ] +
+            section_header(self.signature(), 2) +
+            [format_value(self.description), '']
+        )
 
 
 SECTION_UNDERLINING = ['=', '-', '`']
@@ -206,57 +475,107 @@ def section_header(name, level):
     ]
 
 
-def doc_tables(conn, schema_name):
-    return section_header('Tables', 1) + list(chain(
-        ljoin(
-            '',
-            (table.to_rst() for table in Table.load_all(conn, schema_name))
-        )
-    ))
-
-
-def doc_functions(conn, schema_name):
+def doc_functions_table(functions):
     column_names = ["Name", "Return Type", "Description"]
 
     return section_header('Functions', 1) + [''] + list(to_lines(tabulate(
         [
-            ('{}({})'.format(function.name, function.arguments), function.return_type, function.description)
-            for function in Function.load_all(conn, schema_name)
+            (
+                ':ref:`{}({})<{}>`'.format(function.name, ', '.join(map(str, function.arguments)), function.ident()),
+                function.return_type,
+                get_short_description(format_value(function.description))
+            )
+            for function in functions
         ],
         headers=column_names,
         tablefmt="grid"
     )))
 
 
-all_doc_types = [doc_tables, doc_functions]
+SYSTEM_SCHEMAS = [
+    'pg_toast',
+    'pg_temp_1',
+    'pg_toast_temp_1',
+    'pg_catalog',
+    'information_schema',
+    'dep_recurse'
+]
+
+
+all_doc_types = [Schema.doc_tables, Schema.doc_functions]
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('schemas', nargs='*')
-    parser.add_argument('--tables', dest='doc_types', action='append_const', const=doc_tables)
-    parser.add_argument('--functions', dest='doc_types', action='append_const', const=doc_functions)
+    parser.add_argument(
+        '--tables', dest='doc_types', action='append_const',
+        const=Schema.doc_tables
+    )
+    parser.add_argument(
+        '--functions', dest='doc_types', action='append_const',
+        const=Schema.doc_functions
+    )
+    parser.add_argument(
+        '--output-files',
+        help='Write to files in specified directory instead of to stdout'
+    )
 
     args = parser.parse_args()
 
     with closing(psycopg2.connect('')) as conn:
-        schema_names = args.schemas or Schema.all_names(conn)
+        db = Database().load(conn)
+
+        schema_names = (
+            args.schemas or
+            [
+                name
+                for name in Schema.all_names(conn)
+                if name not in SYSTEM_SCHEMAS
+            ]
+        )
+
+        index_lines = section_header('Schema Reference', 0) + ['.. toctree::']
+
+        index_lines += [
+            '    {}'.format(schema_name) for schema_name in schema_names
+        ]
+
+        if args.output_files:
+            file_path = os.path.join(args.output_files, 'index.rst')
+
+            with open(file_path, 'w') as out_file:
+                out_file.write(unlines(index_lines))
 
         for schema_name in schema_names:
-            description = Schema.load_description(conn, schema_name)
+            if args.output_files:
+                file_path = os.path.join(
+                    args.output_files, '{}.rst'.format(schema_name)
+                )
 
-            print(unlines(
-                section_header(schema_name, 0) + [
-                    '',
-                    format_value(description),
-                    ''
-                ]
-            ))
+                def open_file():
+                    return closing(open(file_path, 'w'))
+            else:
+                open_file = k(sys.stdout)
 
-            doc_types = args.doc_types or all_doc_types
+            with open_file() as out_file:
+                schema = [
+                    schema for schema in db.schema.values()
+                    if schema.name == schema_name
+                ][0]
 
-            for doc_type in doc_types:
-                print(unlines(doc_type(conn, schema_name)))
+                print(unlines(
+                    section_header(schema_name, 0) + [
+                        '',
+                        format_value(schema.description),
+                        ''
+                    ]
+                ), file=out_file)
+
+                doc_types = args.doc_types or all_doc_types
+
+                for doc_type in doc_types:
+                    print(unlines(doc_type(schema, db)), file=out_file)
 
 
 if __name__ == '__main__':
